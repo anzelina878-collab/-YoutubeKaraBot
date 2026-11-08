@@ -134,10 +134,11 @@ def report(db, now, dry_run=False):
         channel_id = video['snippet']['channelId']
         if channel_id in channels_seen:
             continue
-        channel = youtube('channels', part='statistics', id=channel_id).get('items', [])
+        channel = youtube('channels', part='statistics,snippet', id=channel_id).get('items', [])
         stats = channel[0].get('statistics', {}) if channel else {}
         if stats.get('hiddenSubscriberCount') or 'subscriberCount' not in stats:
             continue
+        video['snippet']['channelLanguage'] = channel[0].get('snippet', {}).get('defaultLanguage')
         subs = int(stats['subscriberCount'])
         views = int(video['statistics'].get('viewCount', 0))
         if not 100 <= subs <= int(os.getenv('MAX_SUBSCRIBERS', '300000')):
@@ -200,7 +201,7 @@ def main():
         report(db, dt.datetime.now(UTC), args.dry_run)
         return
     retry_after = 0
-    print('Бот запущен. Расписание: 10,12,14,16,18,20 Europe/Kyiv.', flush=True)
+    print('KARA-CARDS-3 | Бот запущен. Расписание: 10,12,14,16,18,20 Europe/Kyiv.', flush=True)
     while True:
         now = dt.datetime.now(UTC)
         key = slot(now)
