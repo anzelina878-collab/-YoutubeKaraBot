@@ -29,7 +29,13 @@ class BotTests(unittest.TestCase):
             rows = [(5000, video('a', 'one'), 'en'), (5000, video('b', 'two'), 'fr')]
             with patch.object(bot, 'discover', return_value=rows), patch.object(bot, 'baseline', return_value=(1000, 5)), patch.object(bot, 'youtube', return_value={'items': [{'statistics': {'subscriberCount': '5000'}}]}), patch.object(bot, 'telegram') as send:
                 self.assertEqual(bot.report(db, now), 1)
-                self.assertIn('Что можно снять', send.call_args.kwargs['text'])
+                text = send.call_args.kwargs['text']
+                self.assertIn('Что снять первым', text)
+                self.assertIn('https://www.youtube.com/channel/one', text)
+                self.assertIn('Язык: не указан', text)
+                self.assertNotIn('Кандидат для исследования', text)
+                self.assertNotIn('метаданные', text)
+                self.assertLess(len(text), 4096)
                 self.assertEqual(bot.report(db, now), 0)
                 send.assert_called_once()
 
