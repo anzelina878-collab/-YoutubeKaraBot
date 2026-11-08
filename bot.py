@@ -261,6 +261,37 @@ def slot(now):
     return None
 
 
+def scheduled_delivery(db, now):
+    key = slot(now)
+    if not key or db.execute('SELECT 1 FROM runs WHERE slot=?', (key,)).fetchone():
+        return 0
+    try:
+        delivered = report(db, now)
+    except ApiError as exc:
+        if exc.service != 'YouTube':
+            raise
+        save_cooldown(db, dt.datetime.now(UTC).timestamp() + retry_delay(exc, now))
+        print('Поиск отложен:', str(exc), flush=True)
+        delivered = 0
+    except (urllib.error.URLError, TimeoutError):
+        save_cooldown(db, dt.datetime.now(UTC).timestamp() + 600)
+        print('Поиск отложен: ошибка соединения', flush=True)
+        delivered = 0
+    if not delivered:
+        name, _, ideas, approach, _ = TOPICS[topic_for(now)]
+        lines = [f'💡 Идея для теста: {name}', '', '🎬 Подача', approach,
+                 '', 'Что снять первым:']
+        lines += [f'{i}. {title}' for i, title in enumerate(ideas, 1)]
+        lines += ['', 'С чего начать', 'Подготовь три ролика по 12–20 минут с собственными сценариями.',
+                  '', 'Это редакционная идея. Свежие каналы-примеры для неё пока не отобраны; язык аудитории можно выбрать под свою озвучку.']
+        telegram('sendMessage', chat_id=os.environ['TELEGRAM_CHAT_ID'], text='\n'.join(lines),
+                 link_preview_options={'is_disabled': True})
+        delivered = 1
+    db.execute('INSERT OR IGNORE INTO runs VALUES(?)', (key,))
+    db.commit()
+    return delivered
+
+
 def send_examples():
     cards = [
         "💡 Ниша: географические загадки на картах\n\n🎬 Подача\nКарты, простые 2D-схемы и закадровая озвучка.\n\nЧто снять первым:\n1. Почему между соседними островами нет моста?\n2. Что скрывает рельеф под глубоким озером?\n3. Почему два близких города трудно соединить дорогой?\n\nПочему стоит попробовать\nУ японского канала 深読み地図 ролик о мосте между Сикоку и Кюсю набрал около 2,3 млн просмотров, а ролик о Гавайях — около 498 тыс.\n\n📺 Канал: 深読み地図\nhttps://www.youtube.com/@fukayomi-chizu\nЯзык: японский\nПример: https://www.youtube.com/watch?v=3xdIwOjzUL8\n\nИдеи — предложения для самостоятельных роликов. Данные из подборки на 6 ноября 2026, сейчас не перепроверены. Отсутствие автора в кадре и монетизацию проверь вручную.",
@@ -306,23 +337,20 @@ def main():
     if args.once or args.dry_run:
         report(db, dt.datetime.now(UTC), args.dry_run)
         return
-    retry_after = cooldown_until(db)
-    print('KARA-CARDS-3.2 | Бот запущен. Расписание: 10,12,14,16,18,20 Europe/Kyiv.', flush=True)
+    delivery_retry_after = 0
+    print('KARA-CARDS-3.3 | Бот запущен. Расписание: 10,12,14,16,18,20 Europe/Kyiv.', flush=True)
     while True:
         now = dt.datetime.now(UTC)
         key = slot(now)
-        if key and now.timestamp() >= retry_after and not db.execute('SELECT 1 FROM runs WHERE slot=?', (key,)).fetchone():
+        if key and now.timestamp() >= delivery_retry_after and not db.execute('SELECT 1 FROM runs WHERE slot=?', (key,)).fetchone():
             try:
-                delivered = report(db, now)
-                db.execute('INSERT INTO runs VALUES(?)', (key,))
-                db.commit()
+                delivered = scheduled_delivery(db, now)
                 print(f'Цикл {key}: отправлено {delivered}', flush=True)
             except Exception as exc:
                 # Never print HTTP exception URLs: they may contain API tokens.
                 print('Сбой цикла:', str(exc) if isinstance(exc, ApiError) else type(exc).__name__, flush=True)
                 delay = retry_delay(exc, dt.datetime.now(UTC))
-                retry_after = dt.datetime.now(UTC).timestamp() + delay
-                save_cooldown(db, retry_after)
+                delivery_retry_after = dt.datetime.now(UTC).timestamp() + delay
                 print(f'Повтор не ранее чем через {int(delay // 60)} мин.', flush=True)
         time.sleep(30)
 
