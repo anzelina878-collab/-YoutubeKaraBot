@@ -22,6 +22,37 @@ class BotTests(unittest.TestCase):
         delay = bot.retry_delay(bot.ApiError('YouTube', 403, 'quotaExceeded'), now)
         self.assertEqual(delay, 16*3600+5*60)
 
+    def test_rate_limit_backoff_and_persistent_state(self):
+        now = dt.datetime.now(bot.UTC)
+        self.assertEqual(bot.retry_delay(bot.ApiError('YouTube', 429, 'RATE_LIMIT_EXCEEDED'), now), 3600)
+        with patch.dict(bot.os.environ, {'DATABASE_PATH': ':memory:'}):
+            db = bot.database()
+            bot.save_cooldown(db, now.timestamp()+3600)
+            with patch.object(bot, 'discover') as search:
+                self.assertEqual(bot.report(db, now), 0)
+                search.assert_not_called()
+
+    def test_search_cache_survives_partial_retry(self):
+        now = dt.datetime.now(bot.UTC)
+        with patch.dict(bot.os.environ, {'DATABASE_PATH': ':memory:'}):
+            db = bot.database()
+            with patch.object(bot, 'youtube', return_value={'items': []}) as search:
+                bot.cached_search(db, 'topic:en', now, q='example')
+                bot.cached_search(db, 'topic:en', now+dt.timedelta(minutes=60), q='example')
+                self.assertEqual(search.call_count, 1)
+                bot.cached_search(db, 'topic:en', now+dt.timedelta(hours=3), q='example')
+                self.assertEqual(search.call_count, 2)
+
+    def test_examples_do_not_use_youtube(self):
+        with patch.dict(bot.os.environ, {'TELEGRAM_CHAT_ID': '42'}):
+            with patch.object(bot, 'telegram') as send, patch.object(bot, 'youtube') as yt, patch.object(bot.time, 'sleep'):
+                bot.send_examples()
+                self.assertEqual(send.call_count, 2)
+                yt.assert_not_called()
+                for call in send.call_args_list:
+                    self.assertLess(len(call.kwargs['text']), 4096)
+                    self.assertIn('Язык:', call.kwargs['text'])
+
     def test_schedule_dst(self):
         self.assertEqual(bot.slot(dt.datetime(2026, 11, 8, 8, 0, tzinfo=bot.UTC)), '2026-11-08-10')
         self.assertEqual(bot.slot(dt.datetime(2026, 7, 8, 7, 0, tzinfo=bot.UTC)), '2026-07-08-10')
