@@ -31,15 +31,17 @@ def load_env():
 
 
 class ApiError(Exception):
-    def __init__(self, service, status, reason):
+    def __init__(self, service, status, reason, limit=None):
+        self.limit = limit
         self.service, self.status, self.reason = service, status, reason
-        super().__init__(f'{service}: HTTP {status}, причина={reason}')
+        super().__init__(f'{service}: HTTP {status}, причина={reason}' + (f', лимит={limit}' if limit else ''))
 
 
 def safe_http_error(url, status, body):
     host = urllib.parse.urlsplit(url).hostname
     service = 'YouTube' if host == 'www.googleapis.com' else 'Telegram' if host == 'api.telegram.org' else 'HTTP'
     reason = 'unknown'
+    limit = None
     try:
         data = json.loads(body)
         if service == 'YouTube':
@@ -51,6 +53,9 @@ def safe_http_error(url, status, body):
             reason = raw if raw in allowed else 'unclassified'
             # ErrorInfo reasons expose API restrictions without logging free-text messages.
             for detail in data.get('error', {}).get('details', []):
+                candidate = detail.get('metadata', {}).get('quota_limit', '')
+                if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,100}', candidate) and any(x in candidate.lower() for x in ('perday', 'perminute', 'persecond')):
+                    limit = candidate
                 r = detail.get('reason')
                 if r in {'API_KEY_INVALID', 'API_KEY_SERVICE_BLOCKED', 'API_KEY_HTTP_REFERRER_BLOCKED',
                          'API_KEY_IP_ADDRESS_BLOCKED', 'SERVICE_DISABLED', 'RATE_LIMIT_EXCEEDED'}:
@@ -69,7 +74,7 @@ def safe_http_error(url, status, body):
                 reason = 'rate_limit'
     except (ValueError, TypeError, AttributeError, IndexError):
         pass
-    return ApiError(service, status, reason)
+    return ApiError(service, status, reason, limit)
 
 
 def request(url, data=None):
@@ -83,12 +88,12 @@ def request(url, data=None):
 
 
 def retry_delay(exc, now):
-    if isinstance(exc, ApiError) and exc.reason in {'quotaExceeded', 'dailyLimitExceeded'}:
+    if isinstance(exc, ApiError) and (exc.reason in {'quotaExceeded', 'dailyLimitExceeded', 'local_daily_budget'} or 'perday' in (exc.limit or '').lower()):
         pacific = now.astimezone(ZoneInfo('America/Los_Angeles'))
         reset = dt.datetime.combine(pacific.date()+dt.timedelta(days=1), dt.time(0, 5), pacific.tzinfo)
         return max(600, (reset.astimezone(UTC)-now).total_seconds())
     if isinstance(exc, ApiError) and (exc.status == 429 or exc.reason in {'RATE_LIMIT_EXCEEDED', 'rateLimitExceeded'}):
-        return 3600
+        return 900 if exc.limit and any(x in exc.limit.lower() for x in ('perminute', 'persecond')) else 3600
     return 600
 
 
@@ -102,13 +107,41 @@ def telegram(method, **data):
 _last_youtube_request = None
 
 
+def api_store():
+    path = os.getenv('DATABASE_PATH', 'state.sqlite3')
+    db = sqlite3.connect(path + '.api-cache')
+    db.executescript('CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY, expires REAL, data TEXT);'
+                     'CREATE TABLE IF NOT EXISTS usage(day TEXT PRIMARY KEY, searches INTEGER);')
+    return db
+
+
 def youtube(resource, **params):
     global _last_youtube_request
-    if _last_youtube_request is not None:
-        time.sleep(max(0, 2.0 - (time.monotonic() - _last_youtube_request)))
-    _last_youtube_request = time.monotonic()
-    params['key'] = os.environ['YOUTUBE_API_KEY']
-    return request('https://www.googleapis.com/youtube/v3/' + resource + '?' + urllib.parse.urlencode(params))
+    cache_key = resource + ':' + json.dumps(params, sort_keys=True)
+    with api_store() as db:
+        row = db.execute('SELECT expires,data FROM cache WHERE key=?', (cache_key,)).fetchone()
+        if row and row[0] > time.time():
+            return json.loads(row[1])
+        if resource == 'search':
+            day = dt.datetime.now(ZoneInfo('America/Los_Angeles')).date().isoformat()
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT searches FROM usage WHERE day=?', (day,)).fetchone()
+            used = row[0] if row else 0
+            if used >= int(os.getenv('DAILY_SEARCH_BUDGET', '48')):
+                raise ApiError('YouTube', 429, 'local_daily_budget', 'SearchesPerDay')
+            db.execute('INSERT OR REPLACE INTO usage VALUES(?,?)', (day, used+1))
+            db.commit()
+        interval = 10.0 if resource == 'search' else 2.0
+        if _last_youtube_request is not None:
+            time.sleep(max(0, interval - (time.monotonic() - _last_youtube_request)))
+        _last_youtube_request = time.monotonic()
+        params['key'] = os.environ['YOUTUBE_API_KEY']
+        result = request('https://www.googleapis.com/youtube/v3/' + resource + '?' + urllib.parse.urlencode(params))
+        ttl = 21600 if resource == 'search' else 7200
+        db.execute('INSERT OR REPLACE INTO cache VALUES(?,?,?)',
+                   (cache_key, time.time()+ttl, json.dumps(result)))
+        db.execute('DELETE FROM cache WHERE expires < ?', (time.time(),))
+        return result
 
 
 def duration(value):
@@ -220,13 +253,24 @@ def report(db, now, dry_run=False, index=None, languages=None):
     if now.timestamp() < cooldown_until(db):
         return 0
     rows = discover(db, now, index=index, languages=languages)
+    print(f'Направление {index}: кандидатов {len(rows)}', flush=True)
     evidence = []
     channels_seen = set()
+    channel_ids = list(dict.fromkeys(v['snippet']['channelId'] for _, v, _ in rows))
+    channel_map = {}
+    for start in range(0, len(channel_ids), 50):
+        items = youtube('channels', part='statistics,snippet', id=','.join(channel_ids[start:start+50])).get('items', [])
+        for item in items:
+            if 'id' in item:
+                channel_map[item['id']] = item
+        if len(channel_ids) == 1 and items:
+            channel_map.setdefault(channel_ids[0], items[0])
+    baseline_cache = {}
     for rate, video, lang in rows:
         channel_id = video['snippet']['channelId']
         if channel_id in channels_seen:
             continue
-        channel = youtube('channels', part='statistics,snippet', id=channel_id).get('items', [])
+        channel = [channel_map[channel_id]] if channel_id in channel_map else []
         stats = channel[0].get('statistics', {}) if channel else {}
         if stats.get('hiddenSubscriberCount') or 'subscriberCount' not in stats:
             continue
@@ -237,7 +281,9 @@ def report(db, now, dry_run=False, index=None, languages=None):
             continue
         if views < max(10000, subs * 2):
             continue
-        base, count = baseline(video, now)
+        if channel_id not in baseline_cache:
+            baseline_cache[channel_id] = baseline(video, now)
+        base, count = baseline_cache[channel_id]
         if base is None or base <= 0 or rate < base * 2:
             continue
         channels_seen.add(channel_id)
@@ -358,7 +404,7 @@ def main():
         report(db, dt.datetime.now(UTC), args.dry_run)
         return
     delivery_retry_after = 0
-    print('KARA-CARDS-3.4 | Бот запущен. Расписание: 10,12,14,16,18,20 Europe/Kyiv.', flush=True)
+    print('KARA-CARDS-3.5 | Бот запущен. Расписание: 10,12,14,16,18,20 Europe/Kyiv.', flush=True)
     while True:
         now = dt.datetime.now(UTC)
         key = slot(now)
