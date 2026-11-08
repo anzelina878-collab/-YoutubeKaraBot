@@ -53,6 +53,35 @@ class BotTests(unittest.TestCase):
                     self.assertLess(len(call.kwargs['text']), 4096)
                     self.assertIn('Язык:', call.kwargs['text'])
 
+    def test_schedule_delivers_when_search_has_no_results(self):
+        with patch.dict(bot.os.environ, {'DATABASE_PATH': ':memory:', 'TELEGRAM_CHAT_ID': '42'}):
+            db = bot.database()
+            now = dt.datetime(2026, 11, 8, 8, tzinfo=bot.UTC)
+            with patch.object(bot, 'report', return_value=0), patch.object(bot, 'telegram') as send:
+                self.assertEqual(bot.scheduled_delivery(db, now), 1)
+                self.assertEqual(bot.scheduled_delivery(db, now), 0)
+                self.assertEqual(bot.scheduled_delivery(db, now+dt.timedelta(hours=2)), 1)
+                self.assertEqual(send.call_count, 2)
+                self.assertIn('редакционная идея', send.call_args.kwargs['text'])
+
+    def test_youtube_cooldown_does_not_stop_delivery(self):
+        with patch.dict(bot.os.environ, {'DATABASE_PATH': ':memory:', 'TELEGRAM_CHAT_ID': '42'}):
+            db = bot.database()
+            now = dt.datetime(2026, 11, 8, 8, tzinfo=bot.UTC)
+            with patch.object(bot, 'report', side_effect=bot.ApiError('YouTube', 429, 'RATE_LIMIT_EXCEEDED')), patch.object(bot, 'telegram') as send:
+                self.assertEqual(bot.scheduled_delivery(db, now), 1)
+                send.assert_called_once()
+                self.assertGreater(bot.cooldown_until(db), 0)
+
+    def test_telegram_failure_does_not_mark_slot_as_delivered(self):
+        with patch.dict(bot.os.environ, {'DATABASE_PATH': ':memory:', 'TELEGRAM_CHAT_ID': '42'}):
+            db = bot.database()
+            now = dt.datetime(2026, 11, 8, 8, tzinfo=bot.UTC)
+            with patch.object(bot, 'report', return_value=0), patch.object(bot, 'telegram', side_effect=bot.ApiError('Telegram', 403, 'bot_blocked')):
+                with self.assertRaises(bot.ApiError):
+                    bot.scheduled_delivery(db, now)
+                self.assertEqual(db.execute('SELECT count(*) FROM runs').fetchone()[0], 0)
+
     def test_schedule_dst(self):
         self.assertEqual(bot.slot(dt.datetime(2026, 11, 8, 8, 0, tzinfo=bot.UTC)), '2026-11-08-10')
         self.assertEqual(bot.slot(dt.datetime(2026, 7, 8, 7, 0, tzinfo=bot.UTC)), '2026-07-08-10')
