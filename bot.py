@@ -8,6 +8,7 @@ import statistics
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from zoneinfo import ZoneInfo
 from ideas import TOPICS, topic_for, render_card
 
@@ -29,11 +30,64 @@ def load_env():
                     os.environ.setdefault(k, v.strip().strip('"').strip("'"))
 
 
+class ApiError(Exception):
+    def __init__(self, service, status, reason):
+        self.service, self.status, self.reason = service, status, reason
+        super().__init__(f'{service}: HTTP {status}, причина={reason}')
+
+
+def safe_http_error(url, status, body):
+    host = urllib.parse.urlsplit(url).hostname
+    service = 'YouTube' if host == 'www.googleapis.com' else 'Telegram' if host == 'api.telegram.org' else 'HTTP'
+    reason = 'unknown'
+    try:
+        data = json.loads(body)
+        if service == 'YouTube':
+            errors = data.get('error', {}).get('errors', [])
+            raw = errors[0].get('reason', '') if errors else ''
+            allowed = {'quotaExceeded', 'dailyLimitExceeded', 'keyInvalid', 'accessNotConfigured',
+                       'ipRefererBlocked', 'forbidden', 'badRequest', 'invalidParameter',
+                       'youtubeSignupRequired', 'rateLimitExceeded', 'backendError'}
+            reason = raw if raw in allowed else 'unclassified'
+            # ErrorInfo reasons expose API restrictions without logging free-text messages.
+            for detail in data.get('error', {}).get('details', []):
+                r = detail.get('reason')
+                if r in {'API_KEY_INVALID', 'API_KEY_SERVICE_BLOCKED', 'API_KEY_HTTP_REFERRER_BLOCKED',
+                         'API_KEY_IP_ADDRESS_BLOCKED', 'SERVICE_DISABLED', 'RATE_LIMIT_EXCEEDED'}:
+                    reason = r
+        elif service == 'Telegram':
+            desc = str(data.get('description', '')).lower()
+            if 'chat not found' in desc:
+                reason = 'chat_not_found'
+            elif 'blocked' in desc:
+                reason = 'bot_blocked'
+            elif 'too long' in desc:
+                reason = 'message_too_long'
+            elif status == 401:
+                reason = 'token_invalid'
+            elif status == 429:
+                reason = 'rate_limit'
+    except (ValueError, TypeError, AttributeError, IndexError):
+        pass
+    return ApiError(service, status, reason)
+
+
 def request(url, data=None):
     req = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None,
                                  headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=45) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(req, timeout=45) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise safe_http_error(url, exc.code, exc.read(32768)) from None
+
+
+def retry_delay(exc, now):
+    if isinstance(exc, ApiError) and exc.reason in {'quotaExceeded', 'dailyLimitExceeded'}:
+        pacific = now.astimezone(ZoneInfo('America/Los_Angeles'))
+        reset = dt.datetime.combine(pacific.date()+dt.timedelta(days=1), dt.time(0, 5), pacific.tzinfo)
+        return max(600, (reset.astimezone(UTC)-now).total_seconds())
+    return 600
 
 
 def telegram(method, **data):
@@ -201,7 +255,7 @@ def main():
         report(db, dt.datetime.now(UTC), args.dry_run)
         return
     retry_after = 0
-    print('KARA-CARDS-3 | Бот запущен. Расписание: 10,12,14,16,18,20 Europe/Kyiv.', flush=True)
+    print('KARA-CARDS-3.1 | Бот запущен. Расписание: 10,12,14,16,18,20 Europe/Kyiv.', flush=True)
     while True:
         now = dt.datetime.now(UTC)
         key = slot(now)
@@ -213,8 +267,10 @@ def main():
                 print(f'Цикл {key}: отправлено {delivered}', flush=True)
             except Exception as exc:
                 # Never print HTTP exception URLs: they may contain API tokens.
-                print('Сбой цикла:', type(exc).__name__, flush=True)
-                retry_after = time.monotonic() + 600
+                print('Сбой цикла:', str(exc) if isinstance(exc, ApiError) else type(exc).__name__, flush=True)
+                delay = retry_delay(exc, dt.datetime.now(UTC))
+                retry_after = time.monotonic() + delay
+                print(f'Повтор не ранее чем через {int(delay // 60)} мин.', flush=True)
         time.sleep(30)
 
 
