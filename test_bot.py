@@ -87,6 +87,27 @@ class BotTests(unittest.TestCase):
                 send.assert_not_called()
                 self.assertEqual(db.execute('SELECT count(*) FROM runs').fetchone()[0], 0)
 
+    def test_daily_limit_metadata_uses_daily_cooldown(self):
+        body = '{"error":{"details":[{"reason":"RATE_LIMIT_EXCEEDED","metadata":{"quota_limit":"SearchesPerDayPerProject"}}]}}'
+        exc = bot.safe_http_error('https://www.googleapis.com/youtube/v3/search', 429, body)
+        self.assertEqual(exc.limit, 'SearchesPerDayPerProject')
+        now = dt.datetime(2026, 11, 8, 16, tzinfo=bot.UTC)
+        self.assertEqual(bot.retry_delay(exc, now), 16*3600+300)
+
+    def test_api_cache_and_budget_persist(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.dict(bot.os.environ, {'DATABASE_PATH': str(Path(folder)/'state'), 'YOUTUBE_API_KEY': 'SECRET', 'DAILY_SEARCH_BUDGET': '1'}):
+                with patch.object(bot, 'request', return_value={'items': []}) as network, patch.object(bot.time, 'sleep'):
+                    bot.youtube('search', q='first')
+                    bot.youtube('search', q='first')
+                    network.assert_called_once()
+                    with self.assertRaises(bot.ApiError) as raised:
+                        bot.youtube('search', q='second')
+                    self.assertEqual(raised.exception.reason, 'local_daily_budget')
+                    network.assert_called_once()
+
     def test_schedule_dst(self):
         self.assertEqual(bot.slot(dt.datetime(2026, 11, 8, 8, 0, tzinfo=bot.UTC)), '2026-11-08-10')
         self.assertEqual(bot.slot(dt.datetime(2026, 7, 8, 7, 0, tzinfo=bot.UTC)), '2026-07-08-10')
@@ -109,7 +130,7 @@ class BotTests(unittest.TestCase):
             def video(vid, channel):
                 return {'id': vid, 'snippet': {'channelId': channel, 'title': 'Example', 'channelTitle': channel, 'publishedAt': '2026-11-01T00:00:00Z'}, 'statistics': {'viewCount': '50000'}}
             rows = [(5000, video('a', 'one'), 'en'), (5000, video('b', 'two'), 'fr')]
-            with patch.object(bot, 'discover', return_value=rows), patch.object(bot, 'baseline', return_value=(1000, 5)), patch.object(bot, 'youtube', return_value={'items': [{'statistics': {'subscriberCount': '5000'}}]}), patch.object(bot, 'telegram') as send:
+            with patch.object(bot, 'discover', return_value=rows), patch.object(bot, 'baseline', return_value=(1000, 5)), patch.object(bot, 'youtube', return_value={'items': [{'id': 'one', 'statistics': {'subscriberCount': '5000'}}, {'id': 'two', 'statistics': {'subscriberCount': '5000'}}]}), patch.object(bot, 'telegram') as send:
                 self.assertEqual(bot.report(db, now), 1)
                 text = send.call_args.kwargs['text']
                 self.assertIn('Что снять первым', text)
