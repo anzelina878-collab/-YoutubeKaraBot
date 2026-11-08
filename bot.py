@@ -165,12 +165,16 @@ def save_cooldown(db, until):
     db.commit()
 
 
-def discover(db, now):
+def discover(db, now, index=None, languages=None):
     candidates = {}
-    topic = TOPICS[topic_for(now)]
-    for lang, query in zip(LANGS, topic[1]):
-        result = cached_search(db, f'{topic_for(now)}:{lang}', now, part='snippet', type='video', maxResults=25,
-                         q=query, relevanceLanguage=lang, order='viewCount', videoDuration='any',
+    index = topic_for(now) if index is None else index
+    topic = TOPICS[index]
+    queries = dict(zip(LANGS, topic[1]))
+    for position, lang in enumerate(languages or list(LANGS)):
+        query = queries[lang].removesuffix(' faceless')
+        order = 'viewCount' if position % 2 == 0 else 'date'
+        result = cached_search(db, f'expanded:{index}:{lang}:{order}', now, part='snippet', type='video', maxResults=50,
+                         q=query, relevanceLanguage=lang, order=order, videoDuration='any',
                          publishedAfter=(now-dt.timedelta(days=30)).isoformat().replace('+00:00', 'Z'))
         for item in result['items']:
             candidates.setdefault(item['id']['videoId'], lang)
@@ -188,7 +192,7 @@ def discover(db, now):
             if views >= int(os.getenv('MIN_VIEWS', '10000')):
                 results.append((views/age, video, candidates[video['id']]))
     db.commit()
-    return sorted(results, key=lambda row: row[0], reverse=True)[:18]
+    return sorted(results, key=lambda row: row[0], reverse=True)[:60]
 
 
 def baseline(video, now):
@@ -207,15 +211,15 @@ def baseline(video, now):
     return (statistics.median(rates) if len(rates) >= 3 else None), len(rates)
 
 
-def report(db, now, dry_run=False):
-    index = topic_for(now)
+def report(db, now, dry_run=False, index=None, languages=None):
+    index = topic_for(now) if index is None else index
     # One editorial concept per day at most; delivery history survives restarts.
     concept_key = f"idea:{index}:{now.astimezone(ZoneInfo('Europe/Kyiv')).date()}"
     if db.execute('SELECT 1 FROM sent WHERE id=?', (concept_key,)).fetchone():
         return 0
     if now.timestamp() < cooldown_until(db):
         return 0
-    rows = discover(db, now)
+    rows = discover(db, now, index=index, languages=languages)
     evidence = []
     channels_seen = set()
     for rate, video, lang in rows:
@@ -261,34 +265,50 @@ def slot(now):
     return None
 
 
+def search_plan(db, now):
+    key = slot(now)
+    saved = db.execute('SELECT data FROM search_cache WHERE key=?', ('plan:'+key,)).fetchone()
+    if saved:
+        return json.loads(saved[0])
+    row = db.execute("SELECT value FROM runtime WHERE key='search_cursor'").fetchone()
+    cursor = int(row[0]) if row else 0
+    langs = list(LANGS)
+    plan = []
+    for step in range(4):
+        n = cursor + step
+        # Rotate languages after one complete pass through every topic.
+        language_start = (n // len(TOPICS) * 2 + n % 4 * 2) % len(langs)
+        plan.append([(n % len(TOPICS)), [langs[language_start], langs[(language_start+1) % len(langs)]]])
+    db.execute("INSERT OR REPLACE INTO runtime VALUES('search_cursor',?)", (cursor+4,))
+    db.execute('INSERT OR REPLACE INTO search_cache VALUES(?,?,?)',
+               ('plan:'+key, now.timestamp()+86400, json.dumps(plan)))
+    db.commit()
+    return plan
+
+
 def scheduled_delivery(db, now):
     key = slot(now)
     if not key or db.execute('SELECT 1 FROM runs WHERE slot=?', (key,)).fetchone():
         return 0
-    try:
-        delivered = report(db, now)
-    except ApiError as exc:
-        if exc.service != 'YouTube':
-            raise
-        save_cooldown(db, dt.datetime.now(UTC).timestamp() + retry_delay(exc, now))
-        print('Поиск отложен:', str(exc), flush=True)
-        delivered = 0
-    except (urllib.error.URLError, TimeoutError):
-        save_cooldown(db, dt.datetime.now(UTC).timestamp() + 600)
-        print('Поиск отложен: ошибка соединения', flush=True)
-        delivered = 0
-    if not delivered:
-        name, _, ideas, approach, _ = TOPICS[topic_for(now)]
-        lines = [f'💡 Идея для теста: {name}', '', '🎬 Подача', approach,
-                 '', 'Что снять первым:']
-        lines += [f'{i}. {title}' for i, title in enumerate(ideas, 1)]
-        lines += ['', 'С чего начать', 'Подготовь три ролика по 12–20 минут с собственными сценариями.',
-                  '', 'Это редакционная идея. Свежие каналы-примеры для неё пока не отобраны; язык аудитории можно выбрать под свою озвучку.']
-        telegram('sendMessage', chat_id=os.environ['TELEGRAM_CHAT_ID'], text='\n'.join(lines),
-                 link_preview_options={'is_disabled': True})
-        delivered = 1
+    if now.timestamp() < cooldown_until(db):
+        return 0
+    delivered = 0
+    for index, languages in search_plan(db, now):
+        try:
+            delivered += report(db, now, index=index, languages=languages)
+        except ApiError as exc:
+            if exc.service != 'YouTube':
+                raise
+            save_cooldown(db, dt.datetime.now(UTC).timestamp() + retry_delay(exc, now))
+            print('Поиск отложен:', str(exc), flush=True)
+            return delivered
+        except (urllib.error.URLError, TimeoutError):
+            save_cooldown(db, dt.datetime.now(UTC).timestamp() + 600)
+            print('Поиск отложен: ошибка соединения', flush=True)
+            return delivered
     db.execute('INSERT OR IGNORE INTO runs VALUES(?)', (key,))
     db.commit()
+    print(f'Проверено направлений: 4; карточек: {delivered}', flush=True)
     return delivered
 
 
@@ -338,7 +358,7 @@ def main():
         report(db, dt.datetime.now(UTC), args.dry_run)
         return
     delivery_retry_after = 0
-    print('KARA-CARDS-3.3 | Бот запущен. Расписание: 10,12,14,16,18,20 Europe/Kyiv.', flush=True)
+    print('KARA-CARDS-3.4 | Бот запущен. Расписание: 10,12,14,16,18,20 Europe/Kyiv.', flush=True)
     while True:
         now = dt.datetime.now(UTC)
         key = slot(now)
