@@ -5,6 +5,23 @@ import bot
 
 
 class BotTests(unittest.TestCase):
+    def test_errors_never_disclose_secrets(self):
+        url = 'https://www.googleapis.com/youtube/v3/search?key=SECRET'
+        exc = bot.safe_http_error(url, 403, '{"error":{"message":"SECRET", "errors":[{"reason":"quotaExceeded"}]}}')
+        self.assertEqual(str(exc), 'YouTube: HTTP 403, причина=quotaExceeded')
+        self.assertNotIn('SECRET', str(exc))
+        tg = bot.safe_http_error('https://api.telegram.org/botSECRET/sendMessage', 400,
+                                 '{"description":"Bad Request: chat not found SECRET"}')
+        self.assertEqual(tg.reason, 'chat_not_found')
+        self.assertNotIn('SECRET', str(tg))
+        unknown = bot.safe_http_error(url, 403, '{"error":{"errors":[{"reason":"SECRET"}]}}')
+        self.assertNotIn('SECRET', str(unknown))
+
+    def test_quota_reset_uses_pacific_timezone(self):
+        now = dt.datetime(2026, 11, 8, 16, tzinfo=bot.UTC)
+        delay = bot.retry_delay(bot.ApiError('YouTube', 403, 'quotaExceeded'), now)
+        self.assertEqual(delay, 16*3600+5*60)
+
     def test_schedule_dst(self):
         self.assertEqual(bot.slot(dt.datetime(2026, 11, 8, 8, 0, tzinfo=bot.UTC)), '2026-11-08-10')
         self.assertEqual(bot.slot(dt.datetime(2026, 7, 8, 7, 0, tzinfo=bot.UTC)), '2026-07-08-10')
