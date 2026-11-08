@@ -55,7 +55,7 @@ def channel_language(video):
 
 def render_card(index, evidence, now):
     name, _, ideas, approach, difficulty = TOPICS[index]
-    lines = [f'💡 Ниша: {name}', '', '🎬 Как вести без лица', approach,
+    lines = [f'💡 Ниша: {name}', '', '🎬 Подача', approach,
              '', 'Что снять первым:']
     lines += [f'{i}. {title}' for i, title in enumerate(ideas, 1)]
     lines += ['', 'Почему стоит попробовать',
