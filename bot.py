@@ -9,6 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
+from ideas import TOPICS, topic_for, render_card
 
 UTC = dt.timezone.utc
 LANGS = {
@@ -80,9 +81,10 @@ def database():
 
 def discover(db, now):
     candidates = {}
-    for lang, query in LANGS.items():
-        result = youtube('search', part='snippet', type='video', maxResults=10,
-                         q=query, relevanceLanguage=lang, order='viewCount', videoDuration='long',
+    topic = TOPICS[topic_for(now)]
+    for lang, query in zip(LANGS, topic[1]):
+        result = youtube('search', part='snippet', type='video', maxResults=25,
+                         q=query, relevanceLanguage=lang, order='viewCount', videoDuration='any',
                          publishedAfter=(now-dt.timedelta(days=30)).isoformat().replace('+00:00', 'Z'))
         for item in result['items']:
             candidates.setdefault(item['id']['videoId'], lang)
@@ -100,7 +102,7 @@ def discover(db, now):
             if views >= int(os.getenv('MIN_VIEWS', '10000')):
                 results.append((views/age, video, candidates[video['id']]))
     db.commit()
-    return sorted(results, key=lambda row: row[0], reverse=True)[:6]
+    return sorted(results, key=lambda row: row[0], reverse=True)[:18]
 
 
 def baseline(video, now):
@@ -120,35 +122,47 @@ def baseline(video, now):
 
 
 def report(db, now, dry_run=False):
+    index = topic_for(now)
+    # One editorial concept per day at most; delivery history survives restarts.
+    concept_key = f"idea:{index}:{now.astimezone(ZoneInfo('Europe/Kyiv')).date()}"
+    if db.execute('SELECT 1 FROM sent WHERE id=?', (concept_key,)).fetchone():
+        return 0
     rows = discover(db, now)
-    if not rows:
-        return 0  # No filler alerts when no new candidates qualify.
+    evidence = []
+    channels_seen = set()
     for rate, video, lang in rows:
-        base, count = baseline(video, now)
+        channel_id = video['snippet']['channelId']
+        if channel_id in channels_seen:
+            continue
+        channel = youtube('channels', part='statistics', id=channel_id).get('items', [])
+        stats = channel[0].get('statistics', {}) if channel else {}
+        if stats.get('hiddenSubscriberCount') or 'subscriberCount' not in stats:
+            continue
+        subs = int(stats['subscriberCount'])
         views = int(video['statistics'].get('viewCount', 0))
-        comparison = (f'{rate/base:.1f}× медианы просмотров/день у {count} соседних видео'
-                      if base else 'недостаточно сопоставимых видео')
-        snip = video['snippet']
-        message = (f"Кандидат для исследования ниши\n\n{snip['title'][:220]}\n"
-                   f"Канал: {snip['channelTitle']}\n"
-                   f"Язык поиска: {lang}; метаданные языка: {snip.get('defaultAudioLanguage', 'нет данных')}\n"
-                   f"Опубликовано: {snip['publishedAt'][:10]}\n"
-                   f"Длина: {duration(video['contentDetails']['duration'])//60} мин\n"
-                   f"Просмотры: {views:,}; среднее за срок жизни: {rate:,.0f}/день\n"
-                   f"Сравнение: {comparison}. Возраст видео различается.\n"
-                   f"Проверено: {now.strftime('%Y-%m-%d %H:%M UTC')}\n"
-                   f"https://www.youtube.com/watch?v={video['id']}\n\n"
-                   'Это отдельный сигнал, а не подтверждённая новая ниша. '
-                   'Причины успеха и повторяемость у других авторов не проверены.')
-        if dry_run:
-            print(message + '\n')
-        else:
-            telegram('sendMessage', chat_id=os.environ['TELEGRAM_CHAT_ID'], text=message,
-                     link_preview_options={'is_disabled': True})
-            db.execute('INSERT OR IGNORE INTO sent VALUES(?)', (video['id'],))
-            db.commit()
-            time.sleep(1)
-    return len(rows)
+        if not 100 <= subs <= int(os.getenv('MAX_SUBSCRIBERS', '300000')):
+            continue
+        if views < max(10000, subs * 2):
+            continue
+        base, count = baseline(video, now)
+        if base is None or base <= 0 or rate < base * 2:
+            continue
+        channels_seen.add(channel_id)
+        evidence.append((rate, video, lang, base, subs))
+        if len(evidence) == 3:
+            break
+    if len(evidence) < 2:
+        return 0
+    message = render_card(index, evidence, now)
+    if dry_run:
+        print(message)
+    else:
+        telegram('sendMessage', chat_id=os.environ['TELEGRAM_CHAT_ID'], text=message,
+                 link_preview_options={'is_disabled': True})
+        db.executemany('INSERT OR IGNORE INTO sent VALUES(?)',
+                       [(concept_key,)] + [(row[1]['id'],) for row in evidence])
+        db.commit()
+    return 1
 
 
 def slot(now):
