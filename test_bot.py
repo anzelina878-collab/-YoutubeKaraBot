@@ -20,14 +20,25 @@ class BotTests(unittest.TestCase):
         v['snippet']['publishedAt'] = '2026-09-01T00:00:00Z'
         self.assertFalse(bot.eligible(v, now))
 
-    def test_delivery_dedup(self):
+    def test_card_requires_independent_channels(self):
         with patch.dict(bot.os.environ, {'DATABASE_PATH': ':memory:', 'TELEGRAM_CHAT_ID': '42'}):
             db = bot.database()
-            v = {'id': 'abc', 'snippet': {'title': 'Test', 'channelTitle': 'Channel', 'publishedAt': '2026-11-01T00:00:00Z'}, 'contentDetails': {'duration': 'PT20M'}, 'statistics': {'viewCount': '12000'}}
-            with patch.object(bot, 'discover', return_value=[(1000, v, 'en')]), patch.object(bot, 'baseline', return_value=(500, 5)), patch.object(bot, 'telegram') as send, patch.object(bot.time, 'sleep'):
-                bot.report(db, dt.datetime.now(bot.UTC))
+            now = dt.datetime(2026, 11, 8, 12, tzinfo=bot.UTC)
+            def video(vid, channel):
+                return {'id': vid, 'snippet': {'channelId': channel, 'title': 'Example', 'channelTitle': channel, 'publishedAt': '2026-11-01T00:00:00Z'}, 'statistics': {'viewCount': '50000'}}
+            rows = [(5000, video('a', 'one'), 'en'), (5000, video('b', 'two'), 'fr')]
+            with patch.object(bot, 'discover', return_value=rows), patch.object(bot, 'baseline', return_value=(1000, 5)), patch.object(bot, 'youtube', return_value={'items': [{'statistics': {'subscriberCount': '5000'}}]}), patch.object(bot, 'telegram') as send:
+                self.assertEqual(bot.report(db, now), 1)
+                self.assertIn('Что можно снять', send.call_args.kwargs['text'])
+                self.assertEqual(bot.report(db, now), 0)
                 send.assert_called_once()
-                self.assertIsNotNone(db.execute('SELECT 1 FROM sent WHERE id="abc"').fetchone())
+
+    def test_single_channel_is_not_sent(self):
+        with patch.dict(bot.os.environ, {'DATABASE_PATH': ':memory:'}):
+            db = bot.database()
+            with patch.object(bot, 'discover', return_value=[]), patch.object(bot, 'telegram') as send:
+                self.assertEqual(bot.report(db, dt.datetime.now(bot.UTC)), 0)
+                send.assert_not_called()
 
 
 if __name__ == '__main__':
